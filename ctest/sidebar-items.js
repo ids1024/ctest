@@ -1,0 +1,1 @@
+initSidebarItems({"enum":[["Lang","Programming language"]],"struct":[["TestGenerator","A builder used to generate a test suite."]]});
