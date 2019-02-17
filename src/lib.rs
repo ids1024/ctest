@@ -646,7 +646,7 @@ impl TestGenerator {
                 .flag("-Wno-unused-parameter")
                 .flag("-Wno-type-limits")
                 // allow taking address of packed struct members:
-                .flag("-Wno-address-of-packed-member")
+                //.flag("-Wno-address-of-packed-member")
                 .flag("-Wno-deprecated-declarations"); // allow deprecated items
         }
 
@@ -912,6 +912,8 @@ fn default_cfg(target: &str) -> Vec<(String, Option<String>)> {
         ("solaris", "unix", "")
     } else if target.contains("emscripten") {
         ("emscripten", "unix", "")
+    } else if target.contains("minix") {
+        ("minix", "unix", "")
     } else {
         panic!("unknown os/family width: {}", target)
     };
