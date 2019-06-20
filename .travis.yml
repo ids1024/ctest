@@ -26,7 +26,7 @@ matrix:
       osx_image: xcode9.4
       after_script:
         - git clone https://github.com/rust-lang/libc
-        - sed -i '' 's@ctest = "0.2.3"@ctest = { path = "../.." }@g' libc/libc-test/Cargo.toml
+        - sed -i '' 's@ctest = "0.2"@ctest = { path = "../.." }@g' libc/libc-test/Cargo.toml
         - cd libc
         - cargo generate-lockfile --manifest-path libc-test/Cargo.toml
         - |
@@ -38,13 +38,17 @@ matrix:
     - name: "rustfmt"
       install: true
       rust: nightly
-      before_script: rustup component add rustfmt-preview
-      script: cargo fmt --all -- --check
+      script: |
+        if rustup component add rustfmt-preview ; then
+            cargo fmt --all -- --check
+        fi
     - name: "clippy"
       install: true
       rust: nightly
-      before_script: rustup component add clippy-preview
-      script: cargo clippy -- -D clippy::pedantic
+      script: |
+        if rustup component add clippy-preview ; then
+            cargo clippy -- -D clippy::pedantic
+        fi
 
 script:
   - cargo test

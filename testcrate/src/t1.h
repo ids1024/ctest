@@ -43,10 +43,19 @@ void* T1c(void*);
 int32_t T1d(unsigned);
 void T1e(unsigned, const struct T1Bar*);
 void T1f(void);
-void T1g(const int32_t a[4]);
-void T1h(const int32_t a[4]);
+void T1g(int32_t* a);
+void T1h(const int32_t* b);
 void T1i(int32_t a[4]);
-void T1j(int32_t a[4]);
+void T1j(const int32_t b[4]);
+void T1o(int32_t (*a)[4]);
+void T1p(int32_t (*const a)[4]);
+
+typedef int32_t (Arr)[4];
+
+void T1r(Arr a);
+void T1s(const Arr a);
+void T1t(Arr* a);
+void T1v(const Arr* a);
 
 #define T1C 4
 
@@ -132,3 +141,19 @@ struct Pack {
 #ifdef _MSC_VER
 #pragma pack(pop)
 #endif
+
+// volatile pointers in struct fields:
+struct V {
+  volatile uint8_t* v;
+};
+
+// volatile pointers in externs:
+extern volatile uint8_t* vol_ptr;
+
+// volatile pointers in function arguments:
+void* T1_vol0(volatile void*, void*);
+volatile void* T1_vol1(void*, void*);
+volatile void* T1_vol2(void*, volatile void*);
+
+// volatile function pointers:
+uint8_t (*volatile T1_fn_ptr_vol)(uint8_t, uint8_t);

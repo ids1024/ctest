@@ -56,6 +56,8 @@ i! {
 
 const NOT_PRESENT: u32 = 5;
 
+pub type Arr = [i32; 4];
+
 extern "C" {
     pub fn T1a();
     pub fn T1b() -> *mut c_void;
@@ -66,10 +68,17 @@ extern "C" {
     #[link_name = "T1f"]
     pub fn f() -> ();
 
-    pub fn T1g(a: *const [i32; 4]);
-    pub fn T1h(a: &[i32; 4]);
+    pub fn T1g(a: *mut [i32; 4]);
+    pub fn T1h(a: *const [i32; 4]) -> !;
     pub fn T1i(a: *mut [i32; 4]);
-    pub fn T1j(a: &mut [i32; 4]) -> !;
+    pub fn T1j(a: *const [i32; 4]) -> !;
+    pub fn T1o(a: *mut *mut [i32; 4]);
+    pub fn T1p(a: *const *const [i32; 4]) -> !;
+
+    pub fn T1r(a: *mut Arr);
+    pub fn T1s(a: *const Arr) -> !;
+    pub fn T1t(a: *mut *mut Arr);
+    pub fn T1v(a: *const *const Arr) -> !;
 
     pub static T1static: c_uint;
 }
@@ -145,4 +154,17 @@ pub struct T1_conflict {
 pub struct Pack {
     pub a: u8,
     pub b: u16,
+}
+
+#[repr(C)]
+pub struct V {
+    pub v: *mut u8,
+}
+
+extern "C" {
+    pub static mut vol_ptr: *mut u8;
+    pub fn T1_vol0(arg0: *mut c_void, arg1: *mut c_void) -> *mut c_void;
+    pub fn T1_vol1(arg0: *mut c_void, arg1: *mut c_void) -> *mut c_void;
+    pub fn T1_vol2(arg0: *mut c_void, arg1: *mut c_void) -> *mut c_void;
+    pub static T1_fn_ptr_vol: Option<unsafe extern "C" fn(u8, u8) -> u8>;
 }

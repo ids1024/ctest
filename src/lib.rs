@@ -14,6 +14,8 @@
 extern crate cc;
 extern crate syntex_syntax as syntax;
 
+extern crate rustc_version;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -51,6 +53,30 @@ macro_rules! t {
     };
 }
 
+/// Programming language
+#[derive(Debug)]
+pub enum Lang {
+    /// The C programming language.
+    C,
+    /// The C++ programming language.
+    CXX,
+}
+
+/// A kind of item to which the C volatile qualifier could apply.
+#[derive(Debug)]
+pub enum VolatileItemKind {
+    /// A struct field (struct_name, field_name)
+    StructField(String, String),
+    /// An extern static
+    Static(String),
+    /// N-th function argument
+    FunctionArg(String, usize),
+    /// Function return type
+    FunctionRet(String),
+    #[doc(hidden)]
+    __Other,
+}
+
 /// A builder used to generate a test suite.
 ///
 /// This builder has a number of configuration options which modify how the
@@ -59,11 +85,15 @@ macro_rules! t {
 pub struct TestGenerator {
     headers: Vec<String>,
     includes: Vec<PathBuf>,
+    lang: Lang,
     flags: Vec<String>,
     target: Option<String>,
     out_dir: Option<PathBuf>,
     defines: Vec<(String, Option<String>)>,
     cfg: Vec<(String, Option<String>)>,
+    verbose_skip: bool,
+    volatile_item: Box<Fn(VolatileItemKind) -> bool>,
+    array_arg: Box<Fn(&str, usize) -> bool>,
     skip_fn: Box<Fn(&str) -> bool>,
     skip_fn_ptrcheck: Box<Fn(&str) -> bool>,
     skip_static: Box<Fn(&str) -> bool>,
@@ -76,6 +106,8 @@ pub struct TestGenerator {
     field_name: Box<Fn(&str, &str) -> String>,
     type_name: Box<Fn(&str, bool, bool) -> String>,
     fn_cname: Box<Fn(&str, Option<&str>) -> String>,
+    const_cname: Box<Fn(&str) -> String>,
+    rust_version: rustc_version::Version,
 }
 
 struct TyFinder {
@@ -108,11 +140,15 @@ impl TestGenerator {
         Self {
             headers: Vec::new(),
             includes: Vec::new(),
+            lang: Lang::C,
             flags: Vec::new(),
             target: None,
             out_dir: None,
             defines: Vec::new(),
             cfg: Vec::new(),
+            verbose_skip: false,
+            volatile_item: Box::new(|_| false),
+            array_arg: Box::new(|_, _| false),
             skip_fn: Box::new(|_| false),
             skip_fn_ptrcheck: Box::new(|_| false),
             skip_static: Box::new(|_| false),
@@ -133,6 +169,8 @@ impl TestGenerator {
                     f.to_string()
                 }
             }),
+            const_cname: Box::new(std::string::ToString::to_string),
+            rust_version: rustc_version::version().unwrap(),
         }
     }
 
@@ -159,6 +197,21 @@ impl TestGenerator {
         self
     }
 
+    /// Target Rust version: `major`.`minor`.`patch`
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ctest::TestGenerator;
+    ///
+    /// let mut cfg = TestGenerator::new();
+    /// cfg.rust_version(1, 0, 1);
+    /// ```
+    pub fn rust_version(&mut self, major: u64, minor: u64, patch: u64) -> &mut Self {
+        self.rust_version = rustc_version::Version::new(major, minor, patch);
+        self
+    }
+
     /// Add a path to the C compiler header lookup path.
     ///
     /// This is useful for if the C library is installed to a nonstandard
@@ -178,6 +231,24 @@ impl TestGenerator {
     /// ```
     pub fn include<P: AsRef<Path>>(&mut self, p: P) -> &mut Self {
         self.includes.push(p.as_ref().to_owned());
+        self
+    }
+
+    /// Sets the programming language.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::env;
+    /// use std::path::PathBuf;
+    ///
+    /// use ctest::{TestGenerator, Lang};
+    ///
+    /// let mut cfg = TestGenerator::new();
+    /// cfg.language(Lang::CXX);
+    /// ```
+    pub fn language(&mut self, lang: Lang) -> &mut Self {
+        self.lang = lang;
         self
     }
 
@@ -258,7 +329,8 @@ impl TestGenerator {
     ///    .define("_WIN32_WINNT", Some("0x8000"));
     /// ```
     pub fn define(&mut self, k: &str, v: Option<&str>) -> &mut Self {
-        self.defines.push((k.to_string(), v.map(|s| s.to_string())));
+        self.defines
+            .push((k.to_string(), v.map(std::string::ToString::to_string)));
         self
     }
 
@@ -286,7 +358,14 @@ impl TestGenerator {
     ///    .cfg("bar", Some("baz")); // cfg!(bar = "baz")
     /// ```
     pub fn cfg(&mut self, k: &str, v: Option<&str>) -> &mut Self {
-        self.cfg.push((k.to_string(), v.map(|s| s.to_string())));
+        self.cfg
+            .push((k.to_string(), v.map(std::string::ToString::to_string)));
+        self
+    }
+
+    /// Skipped item names are printed to `stderr` if `v` is `true`.
+    pub fn verbose_skip(&mut self, v: bool) -> &mut Self {
+        self.verbose_skip = v;
         self
     }
 
@@ -344,6 +423,81 @@ impl TestGenerator {
         F: Fn(&str, &str) -> String + 'static,
     {
         self.field_name = Box::new(f);
+        self
+    }
+
+    /// Is volatile?
+    ///
+    /// The closure given takes a `VolatileKind` denoting a particular item that
+    /// could be volatile, and returns whether this is the case.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ctest::{TestGenerator, VolatileItemKind::StructField};
+    ///
+    /// let mut cfg = TestGenerator::new();
+    /// cfg.volatile_item(|i| {
+    ///     match i {
+    ///         StructField(ref s, ref f)
+    ///             if s == "foo_struct" && f == "foo_field"
+    ///              => true,
+    ///         _ => false,
+    /// }});
+    /// ```
+    pub fn volatile_item<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(VolatileItemKind) -> bool + 'static,
+    {
+        self.volatile_item = Box::new(f);
+        self
+    }
+
+    /// Is argument of function an array?
+    ///
+    /// The closure denotes whether particular argument of a function is an array.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ctest::{TestGenerator};
+    ///
+    /// let mut cfg = TestGenerator::new();
+    /// cfg.array_arg(|i, n| {
+    ///     match (i, n) {
+    ///         ("foo", 0) => true,
+    ///         _ => false,
+    /// }});
+    /// ```
+    pub fn array_arg<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(&str, usize) -> bool + 'static,
+    {
+        self.array_arg = Box::new(f);
+        self
+    }
+
+    /// Configures how Rust `const`s names are translated to C.
+    ///
+    /// The closure is given a Rust `const` name. The name of the corresponding
+    /// `const` in C is then returned.
+    ///
+    /// By default the `const` name in C just matches the `const` name in Rust.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ctest::TestGenerator;
+    ///
+    /// let mut cfg = TestGenerator::new();
+    /// cfg.const_cname(|c| {
+    ///     c.replace("FOO", "foo")
+    /// });
+    pub fn const_cname<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(&str) -> String + 'static,
+    {
+        self.const_cname = Box::new(f);
         self
     }
 
@@ -628,7 +782,14 @@ impl TestGenerator {
 
         // Compile our C shim to be linked into tests
         let mut cfg = cc::Build::new();
-        cfg.file(&out.with_extension("c"));
+        if let Lang::CXX = self.lang {
+            cfg.cpp(true);
+        }
+        let ext = match self.lang {
+            Lang::C => "c",
+            Lang::CXX => "cpp",
+        };
+        cfg.file(&out.with_extension(ext));
         if target.contains("msvc") {
             cfg.flag("/W3").flag("/Wall").flag("/WX")
                 // ignored warnings
@@ -679,7 +840,11 @@ impl TestGenerator {
             .clone()
             .unwrap_or_else(|| PathBuf::from(env::var_os("OUT_DIR").unwrap()));
         let out_file = out_dir.join(out_file);
-        let c_file = out_file.with_extension("c");
+        let ext = match self.lang {
+            Lang::C => "c",
+            Lang::CXX => "cpp",
+        };
+        let c_file = out_file.with_extension(ext);
         let rust_out = BufWriter::new(t!(File::create(&out_file)));
         let c_out = BufWriter::new(t!(File::create(&c_file)));
         let mut sess = ParseSess::new(FilePathMapping::empty());
@@ -755,11 +920,25 @@ impl TestGenerator {
             t!(writeln!(gen.c, "#include <{}>", header));
         }
 
+        eprintln!("rust version: {}", self.rust_version);
+        t!(gen.rust.write_all(
+            if self.rust_version < rustc_version::Version::new(1, 30, 0) {
+                br#"
+            static FAILED: AtomicBool = std::sync::atomic::ATOMIC_BOOL_INIT;
+            static NTESTS: AtomicUsize = std::sync::atomic::ATOMIC_USIZE_INIT;
+            "#
+            } else {
+                br#"
+            static FAILED: AtomicBool = AtomicBool::new(false);
+            static NTESTS: AtomicUsize = AtomicUsize::new(0);
+            "#
+            }
+        ));
+
         t!(gen.rust.write_all(
             br#"
             use std::any::{Any, TypeId};
             use std::mem;
-            use std::sync::atomic::{ATOMIC_BOOL_INIT, ATOMIC_USIZE_INIT};
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
             fn main() {
@@ -795,9 +974,6 @@ impl TestGenerator {
                 )*)
             }
             p! { i8 i16 i32 i64 u8 u16 u32 u64 usize isize }
-
-            static FAILED: AtomicBool = ATOMIC_BOOL_INIT;
-            static NTESTS: AtomicUsize = ATOMIC_USIZE_INIT;
 
             fn same<T: Eq + Pretty>(rust: T, c: T, attr: &str) {
                 if rust != c {
@@ -912,6 +1088,8 @@ fn default_cfg(target: &str) -> Vec<(String, Option<String>)> {
         ("solaris", "unix", "")
     } else if target.contains("emscripten") {
         ("emscripten", "unix", "")
+    } else if target.contains("wasi") {
+        ("unknown", "", "wasi")
     } else if target.contains("minix") {
         ("minix", "unix", "")
     } else {
@@ -927,6 +1105,13 @@ fn default_cfg(target: &str) -> Vec<(String, Option<String>)> {
     ret.push(("target_env".to_string(), Some(env.to_string())));
 
     ret
+}
+
+fn linkage(lang: &Lang) -> &'static str {
+    match lang {
+        Lang::CXX => "extern \"C\"",
+        Lang::C => "",
+    }
 }
 
 impl<'a> Generator<'a> {
@@ -981,6 +1166,9 @@ impl<'a> Generator<'a> {
 
     fn test_type(&mut self, name: &str, ty: &ast::Ty) {
         if (self.opts.skip_type)(name) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping type \"{}\"", name);
+            }
             return;
         }
         let c = self.rust_ty_to_c_ty(name);
@@ -990,6 +1178,9 @@ impl<'a> Generator<'a> {
 
     fn test_struct(&mut self, ty: &str, s: &ast::VariantData) {
         if (self.opts.skip_struct)(ty) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping struct \"{}\"", ty);
+            }
             return;
         }
 
@@ -1000,6 +1191,7 @@ impl<'a> Generator<'a> {
         t!(writeln!(
             self.rust,
             r#"
+            #[allow(non_snake_case)]
             #[inline(never)]
             fn field_offset_size_{ty}() {{
         "#,
@@ -1017,6 +1209,10 @@ impl<'a> Generator<'a> {
             let name = name.to_string();
 
             if (self.opts.skip_field)(ty, &name) {
+                if self.opts.verbose_skip {
+                    eprintln!("skipping field \"{}\" of struct \"{}\"", name, ty);
+                }
+
                 continue;
             }
 
@@ -1025,10 +1221,10 @@ impl<'a> Generator<'a> {
             t!(writeln!(
                 self.c,
                 r#"
-                uint64_t __test_offset_{ty}_{rust_field}(void) {{
+                {linkage} uint64_t __test_offset_{ty}_{rust_field}(void) {{
                     return offsetof({cstructty}, {c_field});
                 }}
-                uint64_t __test_fsize_{ty}_{rust_field}(void) {{
+                {linkage} uint64_t __test_fsize_{ty}_{rust_field}(void) {{
                     {cstructty}* foo = NULL;
                     return sizeof(foo->{c_field});
                 }}
@@ -1036,14 +1232,17 @@ impl<'a> Generator<'a> {
                 ty = ty,
                 cstructty = cty,
                 rust_field = name,
-                c_field = cfield
+                c_field = cfield,
+                linkage = linkage(&self.opts.lang)
             ));
 
             t!(writeln!(
                 self.rust,
                 r#"
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_offset_{ty}_{field}() -> u64;
+                    #[allow(non_snake_case)]
                     fn __test_fsize_{ty}_{field}() -> u64;
                 }}
                 unsafe {{
@@ -1061,25 +1260,37 @@ impl<'a> Generator<'a> {
             ));
 
             if (self.opts.skip_field_type)(ty, &name.to_string()) {
+                if self.opts.verbose_skip {
+                    eprintln!("skipping field type \"{}\" of struct \"{}\"", name, ty);
+                }
+
                 continue;
             }
 
             let sig = format!("__test_field_type_{}_{}({}* b)", ty, name, cty);
-            let sig = self.csig_returning_ptr(&field.ty, &sig);
+            let mut sig = self.csig_returning_ptr(&field.ty, &sig);
+            if (self.opts.volatile_item)(VolatileItemKind::StructField(
+                ty.to_string(),
+                name.to_string(),
+            )) {
+                sig = format!("volatile {}", sig);
+            }
             t!(writeln!(
                 self.c,
                 r#"
-                {sig} {{
+                {linkage} {sig} {{
                     return &b->{c_field};
                 }}
             "#,
                 sig = sig,
-                c_field = cfield
+                c_field = cfield,
+                linkage = linkage(&self.opts.lang)
             ));
             t!(writeln!(
                 self.rust,
                 r#"
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_field_type_{ty}_{field}(a: *mut {ty})
                                                       -> *mut u8;
                 }}
@@ -1111,20 +1322,24 @@ impl<'a> Generator<'a> {
         t!(writeln!(
             self.c,
             r#"
-            uint64_t __test_size_{ty}(void) {{ return sizeof({cty}); }}
-            uint64_t __test_align_{ty}(void) {{ return {align_of}({cty}); }}
+            {linkage} uint64_t __test_size_{ty}(void) {{ return sizeof({cty}); }}
+            {linkage} uint64_t __test_align_{ty}(void) {{ return {align_of}({cty}); }}
         "#,
             ty = rust,
             cty = c,
-            align_of = align_of
+            align_of = align_of,
+            linkage = linkage(&self.opts.lang)
         ));
         t!(writeln!(
             self.rust,
             r#"
+            #[allow(non_snake_case)]
             #[inline(never)]
             fn size_align_{ty}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_size_{ty}() -> u64;
+                    #[allow(non_snake_case)]
                     fn __test_align_{ty}() -> u64;
                 }}
                 unsafe {{
@@ -1160,6 +1375,10 @@ impl<'a> Generator<'a> {
 
     fn test_sign(&mut self, rust: &str, c: &str, ty: &ast::Ty) {
         if (self.opts.skip_signededness)(rust) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping sign \"{}\"", rust);
+            }
+
             return;
         }
         if !self.has_sign(ty) {
@@ -1168,19 +1387,22 @@ impl<'a> Generator<'a> {
         t!(writeln!(
             self.c,
             r#"
-            uint32_t __test_signed_{ty}(void) {{
+            {linkage} uint32_t __test_signed_{ty}(void) {{
                 return ((({cty}) -1) < 0);
             }}
         "#,
             ty = rust,
-            cty = c
+            cty = c,
+            linkage = linkage(&self.opts.lang)
         ));
         t!(writeln!(
             self.rust,
             r#"
             #[inline(never)]
+            #[allow(non_snake_case)]
             fn sign_{ty}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_signed_{ty}() -> u32;
                 }}
                 unsafe {{
@@ -1211,22 +1433,31 @@ impl<'a> Generator<'a> {
         cty
     }
 
+    #[clippy::allow(clippy::similar_names)]
     fn test_const(&mut self, name: &str, rust_ty: &str) {
         if (self.opts.skip_const)(name) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping const \"{}\"", name);
+            }
+
             return;
         }
+
+        let cname = (self.opts.const_cname)(name);
 
         let cty = self.rust_ty_to_c_ty(rust_ty);
         t!(writeln!(
             self.c,
             r#"
-            static {cty} __test_const_{name}_val = {name};
-            {cty}* __test_const_{name}(void) {{
+            static const {cty} __test_const_{name}_val = {cname};
+            {linkage} const {cty}* __test_const_{name}(void) {{
                 return &__test_const_{name}_val;
             }}
         "#,
             name = name,
-            cty = cty
+            cname = cname,
+            cty = cty,
+            linkage = linkage(&self.opts.lang)
         ));
 
         if rust_ty == "&str" {
@@ -1234,8 +1465,10 @@ impl<'a> Generator<'a> {
                 self.rust,
                 r#"
                 #[inline(never)]
+                #[allow(non_snake_case)]
                 fn const_{name}() {{
                     extern {{
+                        #[allow(non_snake_case)]
                         fn __test_const_{name}() -> *const *const u8;
                     }}
                     let val = {name};
@@ -1253,8 +1486,10 @@ impl<'a> Generator<'a> {
             t!(writeln!(
                 self.rust,
                 r#"
+                #[allow(non_snake_case)]
                 fn const_{name}() {{
                     extern {{
+                        #[allow(non_snake_case)]
                         fn __test_const_{name}() -> *const {ty};
                     }}
                     let val = {name};
@@ -1286,6 +1521,9 @@ impl<'a> Generator<'a> {
         abi: Abi,
     ) {
         if (self.opts.skip_fn)(name) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping fn \"{}\"", name);
+            }
             return;
         }
         let c_name = (self.opts.fn_cname)(name, c_name.as_ref().map(|s| &**s));
@@ -1293,12 +1531,49 @@ impl<'a> Generator<'a> {
             "void".to_string()
         } else {
             args.iter()
-                .map(|a| self.rust_ty_to_c_ty(a))
+                .enumerate()
+                .map(|(idx, a)| {
+                    let mut arg = self.rust_ty_to_c_ty(a);
+                    if (self.opts.volatile_item)(VolatileItemKind::FunctionArg(
+                        name.to_string(),
+                        idx,
+                    )) {
+                        arg = format!("volatile {}", arg);
+                    }
+                    if (self.opts.array_arg)(name, idx) {
+                        if let Some(last_ptr) = arg.rfind("*") {
+                            arg = format!("{}", &arg[..last_ptr]);
+                        } else {
+                            panic!("C FFI decl `{}` contains array argument", name);
+                        }
+                    }
+                    arg
+                })
+                .map(|s| {
+                    if let Some(i) = s.rfind(']') {
+                        let c = s.chars().filter(|&c| c == '*').count();
+                        if c == 0 {
+                            return s;
+                        }
+                        let postfix_idx = s.find('[').unwrap();
+                        let postfix = &s[postfix_idx..=i];
+                        let prefix = &s[..postfix_idx];
+                        let pointers = &s[i + 1..];
+                        let has_const = pointers.contains("const");
+                        let pointers = pointers.replace("const *", "* const");
+                        let prefix = prefix.replacen("const", "", if has_const { 1 } else { 0 });
+                        return format!("{} ({}) {}", prefix, pointers, postfix);
+                    }
+                    return s;
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
                 + if variadic { ", ..." } else { "" }
         };
-        let c_ret = self.rust_ty_to_c_ty(ret);
+        let mut c_ret = self.rust_ty_to_c_ty(ret);
+        if (self.opts.volatile_item)(VolatileItemKind::FunctionRet(name.to_string())) {
+            c_ret = format!("volatile {}", c_ret);
+        }
         let abi = self.abi2str(abi);
         t!(writeln!(
             self.c,
@@ -1316,9 +1591,11 @@ impl<'a> Generator<'a> {
         t!(writeln!(
             self.rust,
             r#"
+            #[allow(non_snake_case)]
             #[inline(never)]
             fn fn_{name}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_fn_{name}() -> *mut u32;
                 }}
                 unsafe {{
@@ -1333,6 +1610,10 @@ impl<'a> Generator<'a> {
             name = name,
             skip = (self.opts.skip_fn_ptrcheck)(name)
         ));
+        if self.opts.verbose_skip && (self.opts.skip_fn_ptrcheck)(name) {
+            eprintln!("skipping fn ptr check \"{}\"", name);
+        }
+
         self.tests.push(format!("fn_{}", name));
     }
 
@@ -1345,29 +1626,34 @@ impl<'a> Generator<'a> {
         mutbl: bool,
     ) {
         if (self.opts.skip_static)(name) {
+            if self.opts.verbose_skip {
+                eprintln!("skipping static \"{}\"", name);
+            }
             return;
         }
 
         let c_name = c_name.unwrap_or_else(|| name.to_string());
 
         if rust_ty.contains("extern fn") {
-            let c_ty = c_ty.replacen("(*)", &format!("(* __test_static_{}(void))", name), 1);
+            let sig = c_ty.replacen("(*)", &format!("(* __test_static_{}(void))", name), 1);
             t!(writeln!(
                 self.c,
                 r#"
-            {ty} {{
+            {sig} {{
                 return {c_name};
             }}
         "#,
-                ty = c_ty,
+                sig = sig,
                 c_name = c_name
             ));
             t!(writeln!(
                 self.rust,
                 r#"
             #[inline(never)]
+            #[allow(non_snake_case)]
             fn static_{name}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_static_{name}() -> {ty};
                 }}
                 unsafe {{
@@ -1408,8 +1694,10 @@ impl<'a> Generator<'a> {
                 self.rust,
                 r#"
             #[inline(never)]
+            #[allow(non_snake_case)]
             fn static_{name}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_static_{name}() -> *{mutbl} {ty};
                 }}
                 unsafe {{
@@ -1424,6 +1712,12 @@ impl<'a> Generator<'a> {
                 ty = rust_ty
             ));
         } else {
+            let c_ty = if (self.opts.volatile_item)(VolatileItemKind::Static(name.to_owned())) {
+                format!("volatile {}", c_ty)
+            } else {
+                c_ty.to_owned()
+            };
+
             t!(writeln!(
                 self.c,
                 r#"
@@ -1443,9 +1737,11 @@ impl<'a> Generator<'a> {
             t!(writeln!(
                 self.rust,
                 r#"
+            #[allow(non_snake_case)]
             #[inline(never)]
             fn static_{name}() {{
                 extern {{
+                    #[allow(non_snake_case)]
                     fn __test_static_{name}() -> *{mutbl} {ty};
                 }}
                 unsafe {{
@@ -1506,8 +1802,10 @@ impl<'a> Generator<'a> {
                         ast::TyKind::Ptr(..) => {
                             format!("{} {}*", self.ty2name(&t.ty, rust), modifier)
                         }
-                        ast::TyKind::Array(ref t, _) => {
-                            format!("{}{}*", modifier, self.ty2name(t, rust))
+                        ast::TyKind::Array(ref t, ref e) => {
+                            let len = self.expr2str(e);
+                            let ty = self.ty2name(t, rust);
+                            format!("{} {} [{}]", modifier, ty, len)
                         }
                         _ => format!("{}{}*", modifier, self.ty2name(&t.ty, rust)),
                     }
@@ -1783,6 +2081,15 @@ impl<'a, 'v> Visitor<'v> for Generator<'a> {
         match i.node {
             ast::ForeignItemKind::Fn(ref decl, ref generics) => {
                 self.assert_no_generics(i.ident, generics);
+                for ref arg in &decl.inputs {
+                    if let ast::TyKind::Array(_, _) = arg.ty.node {
+                        panic!(
+                            "Foreing Function decl `{}` uses array in C FFI",
+                            &i.ident.to_string()
+                        );
+                    }
+                }
+
                 let (ret, args, variadic) = self.decl2rust(decl);
                 let c_name = attr::first_attr_value_str_by_name(&i.attrs, "link_name")
                     .map(|i| i.to_string());
